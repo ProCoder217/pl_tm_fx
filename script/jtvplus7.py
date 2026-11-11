@@ -1,0 +1,335 @@
+import os
+import json
+import base64
+import re
+import requests
+from typing import Dict, List, Set, Any, Optional
+from datetime import datetime
+from urllib.parse import urlparse, parse_qs, urlunparse
+
+
+CHANNELS_URL = "https://sportlink-jtv.pages.dev/ztv.json"
+COOKIE_URL = "https://vk-playlist.pages.dev/cookie.json"
+SPORTS_COOKIE_URL = "https://vk-playlist.pages.dev/sportcookie.json"
+
+USER_AGENT = "Virat"
+REFERER = "https://www.jiotv.com/"
+ORIGIN = "https://www.jiotv.com/"
+UPLOAD_TO_GITHUB = True
+
+# TiviMate expects the full ClearKey MIME type
+TIVIMATE_LICENSE_TYPE = "org.w3.clearkey"
+
+HEADER_LINE = (
+    '#EXTM3U url-tvg="https://avkb.short.gy/jioepg.xml.gz" '
+    'tvg-url="https://avkb.short.gy/jioepg.xml.gz" refresh="3600"'
+)
+
+
+def to_base64(text: str) -> str:
+    return base64.b64encode(text.encode("utf-8")).decode("ascii")
+
+
+def _try_repair_json(text: str) -> str:
+    """
+    Lightweight repair for the most common malformed-JSON cases:
+      1. Missing comma between '}' and '{'
+      2. Missing comma between ']' and '{'
+      3. Missing comma between '}' and '"'
+      4. Trailing commas before '}' or ']'
+    Does NOT fix truncation or unescaped control chars.
+    """
+    text = re.sub(r'}(\s*){', r'},\2{', text)
+    text = re.sub(r'](\s*){', r'],\2{', text)
+    text = re.sub(r'}(\s*)"', r'},\2"', text)
+    text = re.sub(r',(\s*[}\]])', r'\1', text)
+    return text
+
+
+def get_json(url: str, repair: bool = True) -> Any:
+    cache_buster = f"{'&' if '?' in url else '?'}t={int(datetime.now().timestamp() * 1000)}"
+    fresh_url = url + cache_buster
+    headers = {"Cache-Control": "no-cache", "Pragma": "no-cache"}
+    resp = requests.get(fresh_url, headers=headers, timeout=30)
+    resp.raise_for_status()
+
+    text = resp.text
+
+    # Truncation check (server cut the response short)
+    cl = resp.headers.get("Content-Length")
+    if cl is not None:
+        try:
+            expected = int(cl)
+            if expected != len(resp.content):
+                print(
+                    f"⚠️  Truncated response for {url}: "
+                    f"expected {expected} bytes, got {len(resp.content)}"
+                )
+        except ValueError:
+            pass
+
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError as e:
+        print(f"⚠️  JSON parse failed for {url}: {e}")
+        pos = getattr(e, "pos", 0) or 0
+        print("---- raw around error ----")
+        print(text[max(0, pos - 300):pos + 300])
+        print("--------------------------")
+        if not repair:
+            raise
+
+        repaired = _try_repair_json(text)
+        try:
+            data = json.loads(repaired)
+            print("✅ JSON repaired successfully (missing/trailing commas fixed).")
+            return data
+        except json.JSONDecodeError as e2:
+            print(f"❌ Repair failed: {e2}")
+            raise
+
+
+def split_url_query(url: str) -> tuple:
+    parsed = urlparse(url)
+    base = urlunparse((parsed.scheme, parsed.netloc, parsed.path, parsed.params, "", ""))
+    query = parsed.query if parsed.query else None
+    return base, query
+
+
+def get_normal_cookie() -> str:
+    try:
+        data = get_json(COOKIE_URL)
+    except Exception as e:
+        print(f"⚠️  Could not fetch normal cookie: {e}")
+        return ""
+
+    if isinstance(data, str):
+        return data
+    if isinstance(data, list):
+        for item in data:
+            if isinstance(item, dict) and "cookie" in item:
+                return item["cookie"]
+        return ""
+    if isinstance(data, dict):
+        return data.get("cookie", "")
+    return ""
+
+
+def get_sports_data() -> Dict[str, Any]:
+    try:
+        data = get_json(SPORTS_COOKIE_URL)
+    except Exception as e:
+        print(f"⚠️  Could not fetch sports data: {e}")
+        return {"sportsIds": set(), "sportsCookies": {}}
+
+    sports_cookies = {}
+
+    # Handle both list and dict shapes defensively
+    if isinstance(data, list):
+        results = data
+    elif isinstance(data, dict):
+        results = data.get("successful_results", []) + data.get("failed_results", [])
+    else:
+        results = []
+
+    for item in results:
+        if not isinstance(item, dict):
+            continue
+        channel_id = item.get("channel_id")
+        if not channel_id:
+            continue
+        final_url = item.get("final_url") or item.get("error_details", {}).get("final_url", "")
+        if not final_url:
+            continue
+        modified_url = final_url.replace("/output/", "/WDVLive/")
+        sports_cookies[str(channel_id)] = modified_url
+
+    return {
+        "sportsIds": set(sports_cookies.keys()),
+        "sportsCookies": sports_cookies,
+    }
+
+
+def _collect_clearkey_entries(channel: Dict[str, Any]) -> List[tuple]:
+    """
+    Returns an ordered list of (keyId, key) tuples.
+    Handles:
+      - single top-level keyId + key
+      - keys: [ {keyId, key}, ... ]   (multiple pairs)
+      - clearkey: { "kid": "key", ... }
+    NOTE: Does NOT deduplicate — duplicates are kept as-is.
+    """
+    entries: List[tuple] = []
+
+    # 1. Top-level keyId + key
+    if channel.get("keyId") and channel.get("key"):
+        entries.append((str(channel["keyId"]), str(channel["key"])))
+
+    # 2. keys array (multiple pairs) — keep all entries including duplicates
+    keys_arr = channel.get("keys")
+    if isinstance(keys_arr, list):
+        for k in keys_arr:
+            if isinstance(k, dict) and k.get("keyId") and k.get("key"):
+                entries.append((str(k["keyId"]), str(k["key"])))
+
+    # 3. clearkey dict fallback
+    ck = channel.get("clearkey")
+    if isinstance(ck, dict):
+        for kid, key in ck.items():
+            entries.append((str(kid), str(key)))
+
+    return entries
+
+
+def create_channel_entry(channel: Dict[str, Any],
+                         normal_cookie: str = "",
+                         sports_cookies: Dict[str, str] = {}) -> str:
+    name = channel.get("name", "")
+    logo = channel.get("logo", "")
+    group = channel.get("group") or channel.get("category") or "Other"
+    url = channel.get("url", "")
+    channel_id = str(channel.get("id", ""))
+
+    lines = []
+    lines.append(
+        f'#EXTINF:-1 tvg-id="{channel_id}" tvg-name="{name}" '
+        f'tvg-logo="{logo}" group-title="{group}", {name}'
+    )
+
+    is_mpd = (channel.get("type") == "dash") or (".mpd" in url.lower())
+
+    if is_mpd:
+        lines.append("#KODIPROP:inputstream.adaptive.manifest_type=mpd")
+
+        clearkey_entries = _collect_clearkey_entries(channel)
+        if clearkey_entries:
+            lines.append(
+                f"#KODIPROP:inputstream.adaptive.license_type={TIVIMATE_LICENSE_TYPE}"
+            )
+            pairs = ",".join(f"{kid}:{key}" for kid, key in clearkey_entries)
+            lines.append(f"#KODIPROP:inputstream.adaptive.license_key={pairs}")
+        elif channel.get("license_url"):
+            lines.append(
+                f"#KODIPROP:inputstream.adaptive.license_type={TIVIMATE_LICENSE_TYPE}"
+            )
+            lines.append(
+                f"#KODIPROP:inputstream.adaptive.license_key={channel['license_url']}"
+            )
+
+    # Resolve final URL: sports override -> normal cookie -> plain url
+    sports_url = sports_cookies.get(channel_id)
+    if sports_url:
+        final_url_with_query = sports_url
+    else:
+        if normal_cookie:
+            sep = "&" if "?" in url else "?"
+            final_url_with_query = f"{url}{sep}{normal_cookie}"
+        else:
+            final_url_with_query = url
+
+    # Strip query from URL — cookie goes into TiviMate pipe header
+    base_url, cookie_query = split_url_query(final_url_with_query)
+
+    # TiviMate-compatible headers:
+    # url|User-Agent=Virat|Cookie=...
+    pipe_parts = [f"User-Agent={USER_AGENT}"]
+    if cookie_query:
+        pipe_parts.append(f"Cookie={cookie_query}")
+
+    final_url = base_url + "|" + "|".join(pipe_parts)
+
+    lines.append(final_url)
+    return "\n".join(lines)
+
+
+def generate_m3u() -> str:
+    try:
+        channels = get_json(CHANNELS_URL)
+    except Exception as e:
+        print(f"❌ Failed to fetch channels: {e}")
+        raise
+
+    if not isinstance(channels, list):
+        raise ValueError(f"Expected list of channels, got {type(channels).__name__}")
+
+    normal_cookie = get_normal_cookie()
+    sports_data = get_sports_data()
+
+    print(f"Channels loaded: {len(channels)}")
+    print(f"Sports-specific URLs loaded: {len(sports_data['sportsIds'])}")
+
+    entries = []
+    for ch in channels:
+        if not isinstance(ch, dict):
+            print(f"⚠️  Skipping non-dict channel entry: {type(ch).__name__}")
+            continue
+        entries.append(create_channel_entry(ch, normal_cookie, sports_data["sportsCookies"]))
+
+    print(f"Channels generated: {len(entries)}")
+    return HEADER_LINE + "\n\n" + "\n\n".join(entries)
+
+
+def upload_to_github(content: str) -> bool:
+    repo_owner = os.environ.get("GITHUB_OWNER")
+    repo_name = os.environ.get("GITHUB_REPO")
+    token = os.environ.get("GITHUB_TOKEN")
+
+    if not all([repo_owner, repo_name, token]):
+        print("⚠️  GitHub credentials missing. Skipping upload.")
+        return False
+    if not UPLOAD_TO_GITHUB:
+        print("⚠️  Upload disabled by UPLOAD_TO_GITHUB flag. Skipping.")
+        return False
+
+    path = "jtvplus3.m3u"
+    api_url = f"https://api.github.com/repos/{repo_owner}/{repo_name}/contents/{path}"
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "User-Agent": "Python-Script",
+        "Accept": "application/vnd.github.v3+json",
+    }
+
+    existing_resp = requests.get(api_url, headers=headers, timeout=30)
+    sha = None
+    existing_content = ""
+    if existing_resp.status_code == 200:
+        existing_json = existing_resp.json()
+        sha = existing_json.get("sha")
+        if existing_json.get("content"):
+            existing_content = base64.b64decode(existing_json["content"]).decode("utf-8")
+
+    def normalize(s: str) -> str:
+        return s.strip().replace("\r", "")
+
+    if sha and normalize(existing_content) == normalize(content):
+        print("No changes detected. Skipping commit.")
+        return True
+
+    payload = {
+        "message": f"Auto update playlist {datetime.now().isoformat()}",
+        "content": to_base64(content),
+        "sha": sha,
+    }
+    put_resp = requests.put(api_url, headers=headers, json=payload, timeout=30)
+    if not put_resp.ok:
+        print(f"❌ GitHub upload failed: {put_resp.status_code} - {put_resp.text}")
+        return False
+    print(f"✅ GitHub upload successful ({put_resp.status_code})")
+    return True
+
+
+def main(output_file: str = "zio.m3u"):
+    try:
+        m3u = generate_m3u()
+        with open(output_file, "w", encoding="utf-8") as f:
+            f.write(m3u)
+        print(f"📁 Playlist saved locally as '{output_file}'")
+        upload_to_github(m3u)
+        print("✅ Playlist updated successfully")
+    except Exception as e:
+        print(f"❌ Error: {e}")
+        raise
+
+
+if __name__ == "__main__":
+    main()
